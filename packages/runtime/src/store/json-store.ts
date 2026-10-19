@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import {
@@ -95,7 +95,7 @@ export class JsonStore {
           // fallback to direct write
           await writeFile(target, JSON.stringify(value, null, 2));
           try {
-            await (await import("node:fs/promises")).unlink(temp);
+            await unlink(temp);
           } catch {
             // ignore temp unlink error
           }
@@ -118,39 +118,56 @@ export class JsonStore {
     };
   }
 
-  private async loadSettings() {
+  /**
+   * Reads and parses one data file. Returns `undefined` when the file is
+   * missing or blank. A file that is not valid JSON (e.g. truncated by a crash
+   * during the non-atomic fallback write) is renamed to
+   * `<file>.corrupt-<timestamp>` and treated as missing, so one bad file does
+   * not keep the whole runtime from starting and its contents stay on disk.
+   */
+  private async readJsonFile(file: string): Promise<unknown> {
+    const target = join(this.dataDir, file);
+    let raw: string;
     try {
-      const raw = await readFile(
-        join(this.dataDir, FILES.settings),
-        "utf-8",
-      );
-      return AppSettingsSchema.parse(JSON.parse(raw));
+      raw = await readFile(target, "utf-8");
     } catch (error) {
-      if (isEnoent(error)) {
-        return AppSettingsSchema.parse({
-          theme: "warm",
-          defaultEngine: "claude",
-          dataDir: this.dataDir,
-          notifications: true,
-        });
-      }
+      if (isEnoent(error)) return undefined;
       throw error;
     }
+    if (!raw.trim()) return undefined;
+    try {
+      return JSON.parse(raw);
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const backup = `${target}.corrupt-${stamp}`;
+      await rename(target, backup);
+      console.error(
+        `[json-store] ${file} is not valid JSON (${error.message}); moved to ${backup} and starting with an empty value.`,
+      );
+      return undefined;
+    }
+  }
+
+  private async loadSettings() {
+    const parsed = await this.readJsonFile(FILES.settings);
+    if (parsed === undefined) {
+      return AppSettingsSchema.parse({
+        theme: "warm",
+        defaultEngine: "claude",
+        dataDir: this.dataDir,
+        notifications: true,
+      });
+    }
+    return AppSettingsSchema.parse(parsed);
   }
 
   private async loadArray<T>(
     file: string,
     schema: z.ZodType<T>,
   ): Promise<T[]> {
-    try {
-      const raw = await readFile(join(this.dataDir, file), "utf-8");
-      if (!raw.trim()) return [];
-      return z.array(schema).parse(JSON.parse(raw));
-    } catch (error) {
-      if (isEnoent(error)) {
-        return [];
-      }
-      throw error;
-    }
+    const parsed = await this.readJsonFile(file);
+    if (parsed === undefined) return [];
+    return z.array(schema).parse(parsed);
   }
 }
